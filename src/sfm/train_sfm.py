@@ -1,14 +1,14 @@
 import torch
-from datasets import SequenceDataset
-import custom_transforms
+from sfm.datasets import SequenceDataset
+import sfm.custom_transforms as custom_transforms
 from tqdm import tqdm
-from model import SfMModel
-from loss_functions import get_all_loss_fn, l2_pose_regularization
+from sfm.model import SfMModel
+from sfm.loss_functions import get_all_loss_fn, l2_pose_regularization
 import argparse
 import wandb
 import numpy as np
 import torch.nn as nn
-from utils import tensor2array, change_bn_momentum
+from sfm.utils import tensor2array, change_bn_momentum
 import torchvision
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -44,7 +44,7 @@ def main():
     np.random.seed(args.seed)
 
     run_wandb = wandb.init(
-        project="deepreefmap",
+        project="kikai",
         name=args.name,
         config=vars(args)
     )
@@ -62,6 +62,7 @@ def main():
         return_reprojections=False
     )
     train_transform = custom_transforms.Compose([
+        custom_transforms.ResizeImagesOnly((192, 320)), 
         custom_transforms.ColorJitter(0.10, 0.10, 0.10, 0.05),
         custom_transforms.RandomHorizontalFlip(),
     ])
@@ -73,9 +74,9 @@ def main():
     val_dataset = SequenceDataset(args.data, train=False, transform=None, seed=args.seed, long_sequence_length=args.subsampled_sequence_length, subsampled_sequence_length=args.subsampled_sequence_length, with_replacement=False)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
 
-    intrinsics = intrinsics.to(device)
+    # by_me intrinsics = intrinsics.to(device)
 
-    model = SfMModel(args).to(device)
+    model = SfMModel(in_channels=3).to(device)
     if args.checkpoint is not None:
         model.load_state_dict(torch.load(args.checkpoint))
     
@@ -88,11 +89,9 @@ def main():
 
         model.train()
 
-        for batch_idx, (images, images_individually_jittered, _) in tqdm(enumerate(train_loader)):
-
+        for batch_idx, (images, images_individually_jittered, intrinsics) in tqdm(enumerate(train_loader)):
             images_individually_jittered = [img.to(device) for img in images_individually_jittered]
-            
-            intrinsics = (model.intrinsics.unsqueeze(0)*model.const_mul + model.const_add).repeat(args.batch_size, 1).detach()
+            intrinsics = intrinsics.to(device)
             updated_intrinsics = intrinsics
 
             depths, poses = model(images_individually_jittered, intrinsics)
@@ -172,13 +171,11 @@ def main():
             val_photometric_loss = []
             val_geometric_consistency_loss = []
             val_smoothness_loss = []
-            for batch_idx, (images, images_individually_jittered, _) in tqdm(enumerate(val_loader)):
-                intrinsics = (model.intrinsics.unsqueeze(0)*model.const_mul + model.const_add).repeat(images[0].shape[0], 1)
-
+            for batch_idx, (images, images_individually_jittered, intrinsics) in tqdm(enumerate(val_loader)):
                 images = [img.to(device) for img in images]
                 intrinsics = intrinsics.to(device)
                 updated_intrinsics = intrinsics
-                depths, poses, _ = model(images, intrinsics)
+                depths, poses = model(images, intrinsics)
 
                 photometric_loss, geometric_consistency_loss, smoothness_loss = compute_loss(images, depths, poses, updated_intrinsics)
                 val_photometric_loss.append(photometric_loss.item())

@@ -3,6 +3,7 @@ import torch
 import random
 import numpy as np
 from PIL import Image
+import torchvision
 import torchvision.transforms.functional as F
 '''Set of tranform random routines that takes list of inputs as arguments,
 in order to have random but coherent transformations.'''
@@ -89,7 +90,15 @@ class RandomHorizontalFlip(object):
                 output_images = [F.hflip(im) for im in images]
                 output_intrinsics = intrinsics
                 
-                w = output_images[0].shape[1]
+                if hasattr(output_images[0], "size"):  # PIL Image
+                    w, h = output_images[0].size
+                elif hasattr(output_images[0], "shape"):  # NumPy array or torch tensor
+                    if isinstance(output_images[0], np.ndarray):
+                        h, w = output_images[0].shape[:2]
+                    elif isinstance(output_images[0], torch.Tensor):
+                        h, w = output_images[0].shape[-2:]
+                else:
+                        raise TypeError("Unknown image type for horizontal flip")
                 output_intrinsics[0, 2] = w - output_intrinsics[0, 2]
             else:
                 output_images = images
@@ -125,3 +134,11 @@ class RandomScaleCrop(object):
         output_intrinsics[1, 2] -= offset_y
 
         return cropped_images, output_intrinsics
+    
+
+class ResizeImagesOnly(object):
+    def __init__(self, size):
+        self.resize = torchvision.transforms.Resize(size)
+    def __call__(self, images, intrinsics):
+        images_resized = [self.resize(img) for img in images]
+        return images_resized, intrinsics
