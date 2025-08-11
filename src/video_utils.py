@@ -77,6 +77,7 @@ def get_gravity_vectors(video, timestamp, number_of_frames):
 
     begin, end = timestamp.split("-")
     #TODO: timestamp parsing!
+    
     if begin == "begin":
         begin = 0
     if end == "end":
