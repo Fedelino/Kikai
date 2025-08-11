@@ -4,7 +4,9 @@ import numpy as np
 import random
 from path import Path
 from PIL import Image
-import custom_transforms
+import json
+import torch
+import sfm.custom_transforms as custom_transforms
 import torchvision
 
 class SequenceDataset(Dataset):
@@ -60,6 +62,23 @@ class SequenceDataset(Dataset):
         self.totensor = torchvision.transforms.ToTensor()
         self.out_transform = normalize
 
+        # by_me. If the dataset has static intrinsics, load them
+        self.static_intrinsics = None
+        intr_json = self.root / "intrinsics.json"
+        if intr_json.is_file():
+            with open(intr_json, "r") as f:
+                K = json.load(f)
+            # Support either dict {"fx","fy","cx","cy",...} or list [fx,fy,cx,cy,(alpha,beta)]
+            if isinstance(K, dict):
+                fx, fy, cx, cy = float(K["fx"]), float(K["fy"]), float(K["cx"]), float(K["cy"])
+            elif isinstance(K, (list, tuple)):
+                fx, fy, cx, cy = map(float, K[:4])
+            else:
+                raise ValueError("intrinsics.json must be dict or list")
+            self.static_intrinsics = torch.tensor([[fx, 0.0, cx],
+                                                   [0.0, fy, cy],
+                                                   [0.0, 0.0, 1.0]], dtype=torch.float32)
+
 
     def __len__(self):
         return self.num_samples
@@ -79,10 +98,12 @@ class SequenceDataset(Dataset):
             indices = sorted(np.random.choice(len(long_sequence), self.subsampled_sequence_length, replace=False), reverse=backward)
         subsampled_sequence = [long_sequence[i] for i in indices]
 
-        # TODO Fix
-        intrinsics = np.eye(3)
+        # by_me
+        intrinsics = (self.static_intrinsics.clone()
+                      if self.static_intrinsics is not None
+                      else torch.eye(3, dtype=torch.float32))
 
-        imgs = [Image.open(img) for img in subsampled_sequence]
+        imgs = [Image.open(img).convert("RGB") for img in subsampled_sequence]
         if self.transform:
             # TODO remove intrinsics
             imgs, intrinsics = self.transform(imgs, intrinsics)
@@ -97,5 +118,5 @@ class SequenceDataset(Dataset):
         else:
             imgs_individually_transformed = imgs_out
         
-        return imgs_out, imgs_individually_transformed, 0
+        return imgs_out, imgs_individually_transformed, intrinsics
     

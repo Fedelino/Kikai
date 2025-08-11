@@ -24,6 +24,18 @@ class SfMModel(nn.Module):
             nn.Conv2d(256, 6, (3, 3), bias=False),
         )  
 
+    def forward(self, images, intrinsics):
+        """
+        images: list of [B,3,H,W] tensors (length T)
+        intrinsics: [B,3,3] or [3,3] tensor
+        """
+        features = [self.extract_features(img) for img in images]
+        if intrinsics.dim() == 2:
+            B = images[0].shape[0]
+            intrinsics = intrinsics.unsqueeze(0).repeat(B, 1, 1)
+        depths, poses, _ = self.get_depth_and_poses_from_features(images, features, intrinsics)
+        return depths, poses
+
     def extract_features(self, x):
         return self.depth_net.encoder(x)
         
