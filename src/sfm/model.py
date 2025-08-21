@@ -40,15 +40,44 @@ class SfMModel(nn.Module):
         return self.depth_net.encoder(x)
         
     def get_depth_and_poses_from_features(self, images, features, intrinsics):
-        depth, pose = get_depths_and_poses(
-                self.depth_net.encoder, 
-                self.depth_net.segmentation_head, 
-                self.depth_net.decoder, 
-                self.pose_decoder,
-                torch.stack(images).transpose(1,0),
-                [torch.stack([features[0][flen]] + [feature[flen] for feature in features]).squeeze() for flen in range(len(features[0]))],
-                self.pose_reduction,
-                self.squeeze_unsqueeze,
-            )
+        T  = len(images)
+        B  = images[0].shape[0]
+
+        # Collapse time into batch: [T*B, 3, H, W]
+        images_bt = torch.cat(images, dim=0)
+
+        # Each level flen: concat over time along batch -> [T*B, C, H, W]
+        features_bt = [
+            torch.cat([f[flen] for f in features], dim=0)
+            for flen in range(len(features[0]))
+        ]
+
+        # Run depth/pose heads on flattened batch
+        depth_bt, pose_bt = get_depths_and_poses(
+            self.depth_net.encoder,
+            self.depth_net.segmentation_head,
+            self.depth_net.decoder,
+            self.pose_decoder,
+            images_bt,
+            features_bt,
+            self.pose_reduction,
+            self.squeeze_unsqueeze,
+        )
+
+        # Shape back to [T, B, ...]
+        # depth_bt is [T*B, 1, H, W] -> [T, B, 1, H, W]
+        depth = depth_bt.view(T, B, *depth_bt.shape[1:])
+        # pose_bt is typically [T*B, 6] (or [T*B, C_p, h, w] if conv); reshape accordingly:
+        pose  = pose_bt.view(T, B, *pose_bt.shape[1:])
+
+        # same depth scaling you had
         depth = (1 / (25 * torch.sigmoid(depth) + 0.1))
-        return depth.squeeze(), pose.squeeze(), intrinsics.repeat(len(images),1)
+
+        # intrinsics expected per-batch; repeat over time dimension
+        if intrinsics is not None:
+   
+            intrinsics_T = intrinsics.unsqueeze(0).expand(T, *intrinsics.shape).contiguous()
+        else:
+            intrinsics_T = None
+
+        return depth, pose, intrinsics_T

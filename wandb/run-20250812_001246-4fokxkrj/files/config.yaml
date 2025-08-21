@@ -1,0 +1,106 @@
+_wandb:
+    value:
+        cli_version: 0.21.1
+        e:
+            vofekemmsru7l405rzh4qwftypwg4cxe:
+                apple:
+                    ecpuCores: 2
+                    gpuCores: 16
+                    memoryGb: 16
+                    name: Apple M1 Pro
+                    pcpuCores: 8
+                    ramTotalBytes: "17179869184"
+                    swapTotalBytes: "2147483648"
+                args:
+                    - --data
+                    - sfm_data
+                    - --checkpoint
+                    - sfm_net.pth
+                    - --name
+                    - kikai
+                cpu_count: 10
+                cpu_count_logical: 10
+                disk:
+                    /:
+                        total: "994662584320"
+                        used: "173258907648"
+                email: linfederico2004@gmail.com
+                executable: /Users/kikaireefs/Kikai/.venv/bin/python
+                git:
+                    commit: 8b56d9ad263ed77612ff2f14cc2dbd72a6b126e2
+                    remote: https://github.com/Fedelino/Kikai.git
+                host: KIKAIREEFSnoMacBook-Pro.local
+                memory:
+                    total: "17179869184"
+                os: macOS-13.5.2-arm64-arm-64bit-Mach-O
+                program: -m sfm.train_sfm
+                python: CPython 3.13.5
+                root: /Users/kikaireefs/Kikai
+                startedAt: "2025-08-11T15:12:46.711009Z"
+                writerId: vofekemmsru7l405rzh4qwftypwg4cxe
+        m: []
+        python_version: 3.13.5
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 63
+                - 74
+            "2":
+                - 1
+                - 41
+                - 49
+                - 63
+                - 74
+            "3":
+                - 13
+                - 16
+            "4": 3.13.5
+            "5": 0.21.1
+            "12": 0.21.1
+            "13": darwin-arm64
+accumulate_steps:
+    value: 1
+batch_size:
+    value: 4
+checkpoint:
+    value: sfm_net.pth
+data:
+    value: sfm_data
+epochs:
+    value: 100
+geometric_consistency_loss_weight:
+    value: 0.5
+intrinsics_file:
+    value: example_inputs/intrinsics.json
+l2_pose_reg_weight:
+    value: 0
+long_sequence_length:
+    value: 2
+lr:
+    value: 0.0001
+name:
+    value: kikai
+neighbor_range:
+    value: 1
+num_workers:
+    value: 4
+padding_mode:
+    value: zeros
+photometric_loss_weight:
+    value: 1
+seed:
+    value: 1
+smoothness_loss_weight:
+    value: 0.1
+subsampled_sequence_length:
+    value: 2
+with_auto_mask:
+    value: false
+with_mask:
+    value: false
+with_replacement:
+    value: false
+with_ssim:
+    value: false

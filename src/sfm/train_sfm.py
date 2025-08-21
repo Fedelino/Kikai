@@ -11,7 +11,12 @@ import torch.nn as nn
 from sfm.utils import tensor2array, change_bn_momentum
 import torchvision
 
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
 parser = argparse.ArgumentParser(description='Structure from Motion Learner training on video sequences',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
@@ -71,19 +76,55 @@ def main():
                                                 seed=args.seed, long_sequence_length=args.long_sequence_length, subsampled_sequence_length=args.subsampled_sequence_length, with_replacement=args.with_replacement)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
-    val_dataset = SequenceDataset(args.data, train=False, transform=None, seed=args.seed, long_sequence_length=args.subsampled_sequence_length, subsampled_sequence_length=args.subsampled_sequence_length, with_replacement=False)
+    val_transform = custom_transforms.Compose([
+        custom_transforms.ResizeImagesOnly((192, 320)),
+    ])
+    val_dataset = SequenceDataset(
+        args.data, train=False, transform=val_transform,
+        seed=args.seed,
+        long_sequence_length=args.subsampled_sequence_length,
+        subsampled_sequence_length=args.subsampled_sequence_length,
+        with_replacement=False
+    )
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
 
     # by_me intrinsics = intrinsics.to(device)
 
     model = SfMModel(in_channels=3).to(device)
     if args.checkpoint is not None:
-        model.load_state_dict(torch.load(args.checkpoint))
+        # Only set weights_only=False if you TRUST this file
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+
+        # Handle common checkpoint formats
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
+            elif "model_state_dict" in ckpt:
+                ckpt = ckpt["model_state_dict"]
+
+        # In case keys are prefixed (e.g., 'module.' from DataParallel)
+        if len(ckpt):
+            first_key = next(iter(ckpt))
+            if first_key.startswith("module."):
+                ckpt = {k[len("module."):]: v for k, v in ckpt.items()}
+
+        model.load_state_dict(ckpt, strict=False)
     
     change_bn_momentum(model,  0.01)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     best_loss = 100000
+
+    val_every = 1 
+    
+    num_train_batches = len(train_loader)
+    num_val_batches   = len(val_loader)
+
+    num_val_passes = (args.epochs // val_every)
+
+    total_steps = args.epochs * num_train_batches + num_val_passes * num_val_batches
+
+    master_pbar = tqdm(total=total_steps, desc="Training (all epochs)", position=0)
 
     for epoch in range(args.epochs):
 
@@ -97,6 +138,9 @@ def main():
             depths, poses = model(images_individually_jittered, intrinsics)
             del images_individually_jittered
             images = [img.to(device) for img in images]
+
+            if isinstance(images, list):
+                images = torch.stack(images, dim=1)
 
             photometric_loss, geometric_consistency_loss, smoothness_loss = compute_loss(images, depths, poses, updated_intrinsics)
 
@@ -166,6 +210,8 @@ def main():
             if batch_idx == 50000:
                 break
 
+            master_pbar.update(1)
+
         model.eval()
         with torch.no_grad():
             val_photometric_loss = []
@@ -174,13 +220,19 @@ def main():
             for batch_idx, (images, images_individually_jittered, intrinsics) in tqdm(enumerate(val_loader)):
                 images = [img.to(device) for img in images]
                 intrinsics = intrinsics.to(device)
-                updated_intrinsics = intrinsics
-                depths, poses = model(images, intrinsics)
 
-                photometric_loss, geometric_consistency_loss, smoothness_loss = compute_loss(images, depths, poses, updated_intrinsics)
+                depths, poses = model(images, intrinsics)  # model still gets the list
+
+                images_t = torch.stack(images, dim=1)      # (B,T,3,H,W) for the loss
+                photometric_loss, geometric_consistency_loss, smoothness_loss = compute_loss(
+                    images_t, depths, poses, intrinsics
+                )
+
                 val_photometric_loss.append(photometric_loss.item())
                 val_geometric_consistency_loss.append(geometric_consistency_loss.item())
                 val_smoothness_loss.append(smoothness_loss.item())
+
+                master_pbar.update(1)
 
 
             val_loss = np.mean(np.array(val_photometric_loss)+np.array(val_geometric_consistency_loss) + np.array(val_smoothness_loss))

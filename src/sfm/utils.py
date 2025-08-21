@@ -56,41 +56,93 @@ def change_bn_momentum(model, new_value):
             module.momentum = new_value
 
 
-def get_depths_and_poses(encoder, segmentation_head, decoder, pose_decoder, images, features_, reduction, squeeze_unsqueeze):
-    b, l, c, h, w = images.shape
+def get_depths_and_poses(
+    encoder, segmentation_head, decoder, pose_decoder,
+    images, features_, reduction, squeeze_unsqueeze
+):
+    import torch
 
-    ref_features = [x[:b] for x in features_]
+    # ---------- Normalize IMAGES to 4D (B*T, C, H, W) ----------
+    if hasattr(images, "dim"):
+        if images.dim() == 5:
+            b, l, c, h, w = images.shape                  # (B, T, C, H, W)
+            images_bt = images.flatten(0, 1)              # (B*T, C, H, W)
+        elif images.dim() == 4:
+            bt, c, h, w = images.shape                     # (B*T, C, H, W)
+            # try to infer (B, T) from features_ if they are 5D
+            if hasattr(features_[-1], "dim") and features_[-1].dim() == 5:
+                b, l, _, _, _ = features_[-1].shape
+                assert b * l == bt, "Inconsistent (B,T) vs images batch"
+            else:
+                # fallback: treat as T=1 (no temporal dimension)
+                b, l = bt, 1
+            images_bt = images
+        else:
+            raise ValueError("images must be a 4D or 5D tensor")
+    else:
+        raise ValueError("images must be a torch.Tensor")
+
+    # ---------- Normalize FEATURES to 4D list ----------
+    if not isinstance(features_, (list, tuple)) or len(features_) == 0:
+        raise ValueError("features_ must be a non-empty list/tuple of tensors")
+
+    if hasattr(features_[-1], "dim") and features_[-1].dim() == 5:
+        # Each level (B, T, C, H, W) -> (B*T, C, H, W)
+        feats_bt = [f.flatten(0, 1) for f in features_]
+        _, c_feat, h_feat, w_feat = feats_bt[-1].shape
+    else:
+        feats_bt = features_
+        _, c_feat, h_feat, w_feat = feats_bt[-1].shape
+
+    # ---------- Rebuild "ref_features" & "features" like your original code ----------
+    # We need the 5D view (B, T, C, H, W) briefly to replicate the logic.
+    # Convert feats_bt back to (B, T, C, H, W) for this manipulation.
+    feats_5d = [f.view(b, l, f.shape[1], f.shape[2], f.shape[3]) for f in feats_bt]
+
+    # ref_features: first B along the (B,T) batch is just the whole batch; keep semantics as in your code
+    ref_features = [x[:, :] for x in feats_5d]  # same as x[:b] in 5D since dim0==B
 
     features = []
-    lf = len(features_)
-    _, c_feat, h_feat, w_feat = features_[-1].shape
+    lf = len(feats_5d)
 
     for i in range(lf):
         if i == lf - 1:
-            features.append(
-                features_[-1][b:] + squeeze_unsqueeze(torch.cat([
-                            features_[-1][b:],
-                            ref_features[-1].reshape(b,1,c_feat,h_feat,w_feat).expand(b, l, c_feat, h_feat, w_feat).reshape(b*l,c_feat, h_feat, w_feat)
-                ], dim=1)))
+            # last level gets concatenation with "reference-expanded" then squeeze/unsqueeze
+            last = feats_5d[-1]  # (B, T, C, H, W)
+            ref_last = ref_features[-1]  # (B, T, C, H, W)
+
+            # expand ref along time and combine like your original:
+            ref_expanded = ref_last.reshape(b, 1, c_feat, h_feat, w_feat) \
+                                   .expand(b, l, c_feat, h_feat, w_feat) \
+                                   .reshape(b * l, c_feat, h_feat, w_feat)  # (B*T, C, H, W)
+
+            last_bt = last.reshape(b * l, c_feat, h_feat, w_feat)           # (B*T, C, H, W)
+
+            mixed = torch.cat([last_bt, ref_expanded], dim=1)               # (B*T, 2C, H, W)
+            mixed = squeeze_unsqueeze(mixed)                                 # keep your op
+            features.append(mixed)                                           # (B*T, 2C, H, W) after squeeze/unsqueeze
         else:
-            features.append(features_[i][b:])
+            # other levels just pass through
+            features.append(feats_bt[i])  # (B*T, C, H, W)
 
+    # ---------- Depth head ----------
+    # decoder(features) -> (B*T, C_d, H, W), seg-head -> (B*T, 1, H, W)
+    depths_bt = segmentation_head(decoder(features))                         # (B*T, 1, H, W)
+    depths = depths_bt.view(b, l, 1, h, w)                                   # (B, T, 1, H, W)
 
-    depths = segmentation_head(decoder(features)).reshape(b, l, 1, h, w)
+    # ---------- Pose head ----------
+    last_feat = features[-1]                                                 # (B*T, C*, Hf, Wf)
+    # reduce channels/spatial as your code
+    last_feat_red = reduction(last_feat)                                     # (B*T, C', Hf, Wf)
+    c_reduced = last_feat_red.shape[1]
+    last_feat_5d = last_feat_red.view(b, l, c_reduced, h_feat, w_feat)       # (B, T, C', Hf, Wf)
 
-    _, c_feat, h_feat, w_feat = features[-1].shape
-    last_feat = features[-1]
+    # build pairwise (i,j) feature grid: (B, T, T, 2C', Hf, Wf) -> (B*T*T, 2C', Hf, Wf)
+    last_i = last_feat_5d.unsqueeze(2).expand(b, l, l, c_reduced, h_feat, w_feat)   # (B, T, T, C', Hf, Wf)
+    features_sq = torch.cat([last_i, last_i.transpose(1, 2)], dim=3)                # concat on channel: 2C'
+    features_sq = features_sq.reshape(b * l * l, 2 * c_reduced, h_feat, w_feat)     # (B*T*T, 2C', Hf, Wf)
 
-    last_feat = reduction(last_feat.reshape(b* l, c_feat, h_feat, w_feat))
-    c_feat = last_feat.shape[1]
-    last_feat = last_feat.reshape(b, l, c_feat, h_feat, w_feat)
-
-
-    last_feat = last_feat.unsqueeze(2).expand(b, l, l, c_feat, h_feat, w_feat).contiguous()
-    features_sq = torch.cat([last_feat, last_feat.transpose(1, 2)], dim=3).reshape(b*l*l, c_feat*2, h_feat, w_feat)
-
-
-    poses = pose_decoder(features_sq)
-    poses = poses.mean(dim=(2,3)).reshape(b,l,l,6)
+    poses_logits = pose_decoder(features_sq)                                        # (B*T*T, 6, Hf, Wf)
+    poses = poses_logits.mean(dim=(2, 3)).reshape(b, l, l, 6)                       # (B, T, T, 6)
 
     return depths, poses * 0.01

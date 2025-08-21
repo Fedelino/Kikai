@@ -1,0 +1,43 @@
+{
+  "os":  "macOS-13.5.2-arm64-arm-64bit-Mach-O",
+  "python":  "CPython 3.13.5",
+  "startedAt":  "2025-08-11T14:56:17.514949Z",
+  "args":  [
+    "--data",
+    "sfm_data",
+    "--checkpoint",
+    "sfm_net.pth",
+    "--name",
+    "kikai"
+  ],
+  "program":  "-m sfm.train_sfm",
+  "git":  {
+    "remote":  "https://github.com/Fedelino/Kikai.git",
+    "commit":  "8b56d9ad263ed77612ff2f14cc2dbd72a6b126e2"
+  },
+  "email":  "linfederico2004@gmail.com",
+  "root":  "/Users/kikaireefs/Kikai",
+  "host":  "KIKAIREEFSnoMacBook-Pro.local",
+  "executable":  "/Users/kikaireefs/Kikai/.venv/bin/python",
+  "cpu_count":  10,
+  "cpu_count_logical":  10,
+  "disk":  {
+    "/":  {
+      "total":  "994662584320",
+      "used":  "173290221568"
+    }
+  },
+  "memory":  {
+    "total":  "17179869184"
+  },
+  "apple":  {
+    "name":  "Apple M1 Pro",
+    "ecpuCores":  2,
+    "pcpuCores":  8,
+    "gpuCores":  16,
+    "memoryGb":  16,
+    "swapTotalBytes":  "2147483648",
+    "ramTotalBytes":  "17179869184"
+  },
+  "writerId":  "8iopzmoj6n8v9cct4w3jl6bmh3ko4919"
+}
