@@ -1,0 +1,4 @@
+[ZoneTransfer]
+ZoneId=3
+ReferrerUrl=https://app.cvat.ai/requests?page=1&pageSize=10
+HostUrl=https://app.cvat.ai/api/tasks/1588003/dataset/download?rq_id=action%3Dexport%26target%3Dtask%26target_id%3D1588003%26user_id%3D284993%26format%3DCOCO_1~0%26subresource%3Dannotations
