@@ -43,6 +43,8 @@ parser.add_argument('--l2_pose_reg_weight', type=float, default=0.0, help='weigh
 parser.add_argument('--accumulate_steps', type=int, default=1, help='number of steps to accumulate gradients over')
 parser.add_argument('--intrinsics_file', default='example_inputs/intrinsics.json', help='path to intrinsics file')
 
+def to_number(x):
+    return x.detach().item() if isinstance(x, torch.Tensor) else float(x)
 def main():
     args = parser.parse_args()
     torch.manual_seed(args.seed)
@@ -74,7 +76,14 @@ def main():
     individual_transform = torchvision.transforms.ColorJitter(0.07, 0.07, 0.07, 0.03)
     train_dataset = SequenceDataset(args.data, train=True, transform=train_transform, individual_transform=individual_transform, 
                                                 seed=args.seed, long_sequence_length=args.long_sequence_length, subsampled_sequence_length=args.subsampled_sequence_length, with_replacement=args.with_replacement)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
+    )
 
     val_transform = custom_transforms.Compose([
         custom_transforms.ResizeImagesOnly((192, 320)),
@@ -86,8 +95,15 @@ def main():
         subsampled_sequence_length=args.subsampled_sequence_length,
         with_replacement=False
     )
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
-
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+    
     # by_me intrinsics = intrinsics.to(device)
 
     model = SfMModel(in_channels=3).to(device)
@@ -228,19 +244,19 @@ def main():
                     images_t, depths, poses, intrinsics
                 )
 
-                val_photometric_loss.append(photometric_loss.item())
-                val_geometric_consistency_loss.append(geometric_consistency_loss.item())
-                val_smoothness_loss.append(smoothness_loss.item())
+                val_photometric_loss.append(to_number(photometric_loss))
+                val_geometric_consistency_loss.append(to_number(geometric_consistency_loss))
+                val_smoothness_loss.append(to_number(smoothness_loss))
 
                 master_pbar.update(1)
 
 
             val_loss = np.mean(np.array(val_photometric_loss)+np.array(val_geometric_consistency_loss) + np.array(val_smoothness_loss))
             run_wandb.log({
-                "val/photometric_loss": np.mean(val_photometric_loss),
-                "val/geometric_consistency_loss": np.mean(val_geometric_consistency_loss),
-                "val/smoothness_loss": np.mean(val_smoothness_loss),
-                "val/total_loss": val_loss,
+                "train/photometric_loss": to_number(photometric_loss),
+                "train/geometric_consistency_loss": to_number(geometric_consistency_loss),
+                "train/smoothness_loss": to_number(smoothness_loss),
+                "train/total_loss": to_number(loss),
             })
             torch.save(model.state_dict(), args.name + "_last.pth")
             if val_loss < best_loss:
