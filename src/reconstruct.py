@@ -16,7 +16,7 @@ from tqdm import tqdm
 import h5py
 import open3d as o3d
 from sklearn.decomposition import PCA
-from reconstruction_utils import get_closest_to_centroid_with_attributes_of_closest_to_cam, map_3d, get_matching_indices, get_rotation_matrix_to_align_pose_with_gravity, get_edgeness
+from reconstruction_utils import get_closest_to_centroid_with_attributes_of_closest_to_cam, map_3d, get_matching_indices, get_rotation_matrix_to_align_pose_with_gravity, get_edgeness, aggregate_2d_grid
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 from sfm.inverse_warp import EUCMCamera, Pose, pose_vec2mat, rectify_eucm
 import scipy
@@ -52,7 +52,6 @@ parser.add_argument('--output_2d_grid_size', type=int, default=2000, help='Size 
 parser.add_argument('--buffer_size', type=int, default=2, help='Number of frames to use for temporal smoothing')
 parser.add_argument('--render_video', action='store_true', help='Whether to render output 4-panel video')
 args = parser.parse_args()
-
 
 def main(args):
     t = time()
@@ -120,207 +119,200 @@ def main(args):
         print("Rendered Video in ", time() - t, "seconds")
     return
 
-
 def reset_batchnorm_layers(model):
     for module in model.modules():
         if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
             module.eps = 1e-4
-
 
 def change_bn_momentum(model, new_value):
     for name, module in model.named_modules():
         if isinstance(module, nn.BatchNorm2d):
             module.momentum = new_value
 
-
 def expand_zeros(mask):
-    mask = mask.unsqueeze(0).unsqueeze(0).float()
+    # Add an extra batch dimension and channel dimension to the mask for convolution
+    mask = mask.unsqueeze(0).unsqueeze(0).float()  # Shape: 1x1xHxW
+    # Define a 3x3 kernel filled with ones
     kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=mask.device)
+    # Perform 2D convolution with padding=1 to keep the same output size
     conv_result = torch.nn.functional.conv2d(mask, kernel, padding=1)
+    # Any place where the convolution result is less than 9 means it had a zero in the neighborhood
     result_mask = (conv_result == 9).squeeze().bool()
     return result_mask
 
-def aggregate_2d_grid(inp, size):
-    """Builds a 2D grid along the two principal components of the point cloud and
-    aggregates per-cell height/color/class."""
-    to_bin = np.floor(inp[:, 0:2] / size).astype(np.int32)
-    inds = np.lexsort(np.transpose(to_bin)[::-1])
-    to_bin = to_bin[inds]
-    inp = inp[inds]
-
-    def aggregate_2d_grid_cell(group):
-        if len(group) == 1:
-            return np.concatenate([group, np.array([[1]])], axis=1)
-        if len(group) == 2:
-            return np.concatenate([group[np.argmax(group[:, 2])], np.array([2])]).reshape(1, -1)
-        z = group[:, 2]
-        mean_height = z.mean()
-        group_ = group[z >= mean_height]
-        if len(group_) == 0:
-            return np.concatenate([group[:1], np.array([[1]])], axis=1)
-        x, y, z, r, g, b, distance_to_cam, class_, class_r, class_g, class_b, frame_index, depth_unc = group_.T
-        from scipy.stats import mode
-        most_common_class = mode(class_, keepdims=False)[0]
-        class_r = class_r[class_ == most_common_class][0]
-        class_g = class_g[class_ == most_common_class][0]
-        class_b = class_b[class_ == most_common_class][0]
-        return np.array([[
-            x[0], y[0], np.mean(z),
-            np.mean(r), np.mean(g), np.mean(b),
-            np.mean(distance_to_cam),
-            most_common_class, class_r, class_g, class_b,
-            np.mean(frame_index), np.mean(depth_unc),
-            len(group)
-        ]])
-
-    counts = np.unique(to_bin, return_counts=True, axis=0)[1]
-    split_idx = np.cumsum(counts)[:-1]
-    splits = np.split(inp, split_idx)
-
-    cells = []
-    for group in splits:
-        arr = aggregate_2d_grid_cell(group)
-        if arr is not None and len(arr) > 0:
-            cells.append(arr)
-
-    if len(cells) == 0:
-        return np.empty((0, 14), dtype=float)
-
-    results = np.concatenate(cells, axis=0)
-    results[:, 0] /= size
-    results[:, 1] /= size
-    return results
-
 def get_nn_predictions(img_list, grav, num_classes, h5f, args):
     totensor = torchvision.transforms.ToTensor()
-    normalize = torchvision.transforms.Normalize(mean=[0.45, 0.45, 0.45],
-                                                std=[0.225, 0.225, 0.225])
+    normalize = torchvision.transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225])
+
+    # ---- SFM model ----
     sfm_model = SfMModel().to(device)
-    sfm_model.load_state_dict(torch.load(args.sfm_checkpoint, map_location=device))
+    state = torch.load(args.sfm_checkpoint, map_location=device, weights_only=False)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    sfm_model.load_state_dict(state)
     change_bn_momentum(sfm_model, 0.01)
     reset_batchnorm_layers(sfm_model)
     sfm_model.eval()
 
+    # ---- Segmentation model ----
     segmentation_model = SegmentationModel(num_classes).to(device)
-    segmentation_model.load_state_dict(torch.load(args.segmentation_checkpoint, map_location=device))
+    state = torch.load(args.segmentation_checkpoint, map_location=device, weights_only=False)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    segmentation_model.load_state_dict(state)
     segmentation_model.eval()
-    
-    intrinsics = torch.tensor(list(json.load(open(args.intrinsics_file)).values())).float().to(device).unsqueeze(0)
 
-    buffer_size = args.buffer_size
-    # Start by initializing, load the images in a buffer of buffer_size subsequent frames
-    images = [normalize(totensor(Image.open(img_list[i]))).to(device).unsqueeze(0) for i in range(buffer_size-1)]
-    
+    # ---- Intrinsics (read keys explicitly; keep EUCM order expected by your code) ----
+    intr = json.load(open(args.intrinsics_file))
+    intrinsics = torch.tensor([intr["fx"], intr["fy"], intr["cx"], intr["cy"], intr["alpha"], intr["beta"]]) \
+        .float().to(device).unsqueeze(0)
+
+    buffer_size = args.buffer_size  # recommend 2 or 3
+
+    # Preload first buffer_size-1 frames
+    images = [normalize(totensor(Image.open(img_list[i]))).to(device).unsqueeze(0) for i in range(max(0, buffer_size - 1))]
     counts = np.zeros(len(img_list), dtype=np.uint8)
-    depths_buffered = h5f.create_dataset("depths_buffered", (args.buffer_size, len(img_list), args.height, args.width), dtype='f4')
-    depths = h5f.create_dataset("depths", (len(img_list), args.height,  args.width), dtype='f4')
-    depth_uncertainties = h5f.create_dataset("depth_uncertainties", (len(img_list), args.height,  args.width), dtype='f4')
-    semantic_segmentation = h5f.create_dataset("semantic_segmentation", (len(img_list), args.height,  args.width), dtype='u1')
-    intrinsics_predicted_buffered = h5f.create_dataset("intrinsics_buffered", (args.buffer_size, len(img_list), 6), dtype='f4')
-    intrinsics_predicted = h5f.create_dataset("intrinsics", (len(img_list), 6), dtype='f4')
-    poses = {}
 
+    depths_buffered = h5f.create_dataset("depths_buffered", (buffer_size, len(img_list), args.height, args.width), dtype='f4')
+    depths = h5f.create_dataset("depths", (len(img_list), args.height, args.width), dtype='f4')
+    depth_uncertainties = h5f.create_dataset("depth_uncertainties", (len(img_list), args.height, args.width), dtype='f4')
+    semantic_segmentation = h5f.create_dataset("semantic_segmentation", (len(img_list), args.height, args.width), dtype='u1')
+    intrinsics_predicted_buffered = h5f.create_dataset("intrinsics_buffered", (buffer_size, len(img_list), 6), dtype='f4')
+    intrinsics_predicted = h5f.create_dataset("intrinsics", (len(img_list), 6), dtype='f4')
+    poses = {}  # will collect pairwise pose[i][j] samples per index
+
+    # ---- warmup seg buffer ----
     semseg_buffer = torch.zeros((3, num_classes, args.height, args.width), requires_grad=False).to(device)
-    wtens = torch.tensor([1.0, 2.0, 1.0], requires_grad=False).to(device).unsqueeze(1).unsqueeze(1).unsqueeze(1)
+    wtens = torch.tensor([1.0, 2.0, 1.0], requires_grad=False).to(device).view(3, 1, 1, 1)
+
     with torch.no_grad():
         semseg_logits = []
-        for i in range(buffer_size-1):
-            semseg_logits.append(segmentation.model.predict(segmentation_model, images[i], num_classes, args.height, args.width))
+        for i in range(max(0, buffer_size - 1)):
+            semseg_logits.append(
+                segmentation.model.predict(segmentation_model, images[i], num_classes, args.height, args.width)
+            )
 
-        
-        for i in range(buffer_size-2):
-            semantic_segmentation[i] = torch.stack(semseg_logits[max(0,i-1):i+1]).mean(dim=0).argmax(dim=0).cpu().numpy()
-        
-        if len(semseg_logits)==1:
+        # write early averaged seg if we actually buffered anything
+        for i in range(max(0, buffer_size - 2)):
+            semantic_segmentation[i] = torch.stack(semseg_logits[max(0, i - 1):i + 1]).mean(dim=0).argmax(dim=0).cpu().numpy()
+
+        # ensure we have two frames in buffer for the weighted avg downstream
+        if len(semseg_logits) == 1:
             semseg_logits.append(semseg_logits[-1])
-        semseg_buffer[0] = semseg_logits[-2]
-        semseg_buffer[1] = semseg_logits[-1]
+        if len(semseg_logits) >= 2:
+            semseg_buffer[0] = semseg_logits[-2]
+            semseg_buffer[1] = semseg_logits[-1]
         del semseg_logits
+
+    # resize preloaded images to depth resolution
     images = [F.resize(x, (args.height, args.width)) for x in images]
     depth_features = [[f.detach() for f in sfm_model.extract_features(x)] for x in images]
-    
 
-    for end_index in tqdm(range(buffer_size-1, len(img_list))):
+    # ---- main loop ----
+    for end_index in tqdm(range(max(0, buffer_size - 1), len(img_list))):
         new_im = normalize(totensor(Image.open(img_list[end_index]))).to(device).unsqueeze(0)
 
-        
         with torch.no_grad():
-            semseg_buffer[2] = segmentation.model.predict(segmentation_model, new_im, num_classes, args.height, args.width)
-            semantic_segmentation[end_index-1] = (semseg_buffer*wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
+            # segmentation
+            new_logit = segmentation.model.predict(segmentation_model, new_im, num_classes, args.height, args.width)
+            semseg_buffer[2] = new_logit
+            if end_index - 1 >= 0:
+                semantic_segmentation[end_index - 1] = (semseg_buffer * wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
             semseg_buffer[:2] = semseg_buffer[1:].clone()
 
-        images.append(F.resize(new_im, (args.height,  args.width)))
-
+        images.append(F.resize(new_im, (args.height, args.width)))
         with torch.no_grad():
             depth_features.append([f.detach() for f in sfm_model.extract_features(images[-1])])
 
-        depth, pose, intrinsics_updated =  sfm_model.get_depth_and_poses_from_features(images, depth_features, intrinsics)
+        depth, pose, intrinsics_updated = sfm_model.get_depth_and_poses_from_features(images, depth_features, intrinsics)
+
         for i in range(buffer_size):
             idx = end_index - buffer_size + i + 1
+            if idx < 0 or idx >= len(img_list):
+                continue
             count = counts[idx]
             depths_buffered[count, idx] = depth[i].squeeze().detach().cpu().numpy()
             intrinsics_predicted_buffered[count, idx] = intrinsics_updated[i].detach().cpu().numpy()
-            counts[idx]+=1
-            for j in range(buffer_size):
-                jdx = end_index - buffer_size + j + 1
-                if pose[i][j] != []:
-                    if idx not in poses:
-                        poses[idx] = {}
-                    if jdx not in poses[idx]:
-                        poses[idx][jdx] = []
-                    poses[idx][jdx].append(pose[i][j].detach().unsqueeze(0).cpu().numpy())
+            counts[idx] = min(count + 1, buffer_size)
 
+        for j in range(buffer_size):
+            jdx = end_index - buffer_size + j + 1
+            if jdx < 0 or jdx >= len(img_list):
+                continue
+            pij = None
+            if isinstance(pose, (list, tuple)) and i < len(pose):
+                row = pose[i]
+                if isinstance(row, (list, tuple)) and j < len(row):
+                    pij = row[j]
+            if pij is None:
+                continue
+            if isinstance(pij, (list, tuple)) and len(pij) == 0:
+                continue
+            if idx not in poses:
+                poses[idx] = {}
+            if jdx not in poses[idx]:
+                poses[idx][jdx] = []
+            poses[idx][jdx].append(pij.detach().unsqueeze(0).cpu().numpy())
 
         images.pop(0)
         depth_features.pop(0)
-    
+
+    # finalize per-frame arrays
     for i in tqdm(range(len(img_list))):
-        depths[i] = np.mean(depths_buffered[:counts[i],i],axis=0)
-    for i in tqdm(range(len(img_list))):
-        depth_uncertainties[i] = np.std(depths_buffered[:counts[i],i],axis=0)
-    for i in tqdm(range(len(img_list))):
-        intrinsics_predicted[i] = np.median(intrinsics_predicted_buffered[:counts[i],i],axis=0)
-        
-    l = len(img_list)
+        if counts[i] > 0:
+            depths[i] = np.mean(depths_buffered[:counts[i], i], axis=0)
+            depth_uncertainties[i] = np.std(depths_buffered[:counts[i], i], axis=0)
+            intrinsics_predicted[i] = np.median(intrinsics_predicted_buffered[:counts[i], i], axis=0)
+        else:
+            depths[i] = depths_buffered[0, i]
+            depth_uncertainties[i] = 0
+            intrinsics_predicted[i] = intrinsics[0].cpu().numpy()
 
     semantic_segmentation[-1] = (semseg_buffer * wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
-    
-    poses = [(torch.tensor(np.median(poses[i+1][i],axis=0) - np.median(poses[i][i+1],axis=0))/2) for i in range(len(poses)-1)]
-    poses = [pose_vec2mat(p).squeeze().cpu().numpy() for p in poses]
-    poses = [np.vstack([p, np.array([0, 0, 0, 1]).reshape(1, 4)]) for p in poses]
 
-    poses = np.array(poses)
-    med_rot = np.median(poses[:,:3,:3]-np.eye(3), axis=0)
-    poses[:,:3,:3] -= med_rot 
-    
-    grav_buffer = 100
+    pose_list = []
+    for k in range(len(poses) - 1):
+        if (k + 1) in poses and k in poses and (k in poses[k + 1]) and ((k + 1) in poses[k]):
+            a = np.median(poses[k + 1][k], axis=0)
+            b = np.median(poses[k][k + 1], axis=0)
+            rel = torch.tensor((a - b) / 2.0)
+            pose_list.append(rel)
+        else:
+            pose_list.append(torch.zeros(6))
+
+    poses_rel = [pose_vec2mat(p).squeeze().cpu().numpy() for p in pose_list]
+    poses_rel = [np.vstack([p, np.array([0, 0, 0, 1]).reshape(1, 4)]) for p in poses_rel]
+    poses_rel = np.array(poses_rel)
+    if len(poses_rel) > 0:
+        med_rot = np.median(poses_rel[:, :3, :3] - np.eye(3), axis=0)
+        poses_rel[:, :3, :3] -= med_rot
+
+    if len(poses_rel) == 0:
+        cum = np.zeros((1, 4, 4)); cum[0] = np.eye(4)
+        return depths, depth_uncertainties, cum, semantic_segmentation, intrinsics_predicted
+
     if grav is not None:
         pose0 = np.eye(4)
-        new_cum_poses = np.zeros((len(poses)+1,4,4))
-
-
-        grav0 = np.mean(grav[:grav_buffer],axis=0)
-
-        correction = get_rotation_matrix_to_align_pose_with_gravity(pose0, grav0)
-        pose0[:3,:3] = correction @ pose0[:3,:3] 
-        new_cum_poses[0] = pose0.copy()
-
-        for i, (pose, g_) in enumerate(zip(poses,grav[1:])):
-
-            g = np.mean(grav[max(0, 1 + i - grav_buffer):min(i + grav_buffer, len(grav-1))], axis=0)
-            pose0 = pose0 @ pose
-            correction = get_rotation_matrix_to_align_pose_with_gravity(pose0, g)
-            pose0[:3,:3] = correction @ pose0[:3,:3] 
-            new_cum_poses[i+1] = pose0.copy()
-        poses = np.array(new_cum_poses)
+        new_cum = np.zeros((len(poses_rel) + 1, 4, 4))
+        g0 = np.mean(grav[:min(100, len(grav))], axis=0)
+        corr = get_rotation_matrix_to_align_pose_with_gravity(pose0, g0)
+        pose0[:3, :3] = corr @ pose0[:3, :3]
+        new_cum[0] = pose0.copy()
+        for i, (p, _) in enumerate(zip(poses_rel, grav[1:])):
+            pose0 = pose0 @ p
+            g = np.mean(grav[max(0, 1 + i - 100):min(i + 100, len(grav) - 1)], axis=0)
+            corr = get_rotation_matrix_to_align_pose_with_gravity(pose0, g)
+            pose0[:3, :3] = corr @ pose0[:3, :3]
+            new_cum[i + 1] = pose0.copy()
+        poses_abs = np.array(new_cum)
     else:
-        new_cum_poses = np.zeros((len(poses)+1,4,4))
-        new_cum_poses[0] = np.eye(4)
-        for i in range(len(poses)):
-            new_cum_poses[i+1] = new_cum_poses[i] @ poses[i]
-        poses = np.array(new_cum_poses)
+        new_cum = np.zeros((len(poses_rel) + 1, 4, 4))
+        new_cum[0] = np.eye(4)
+        for i in range(len(poses_rel)):
+            new_cum[i + 1] = new_cum[i] @ poses_rel[i]
+        poses_abs = np.array(new_cum)
 
-    return depths, depth_uncertainties, poses, semantic_segmentation, intrinsics_predicted
+    return depths, depth_uncertainties, poses_abs, semantic_segmentation, intrinsics_predicted
 
 
 def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_segmentation, intrinsics, label_to_color, class_to_label, h5f, args):
@@ -331,37 +323,28 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
         for val in np.unique(class_arr):
             color_arr[class_arr==val] = label_to_color[val]
         return color_arr
-    dist_cutoffs = []
-    with torch.no_grad(): 
-        
 
+    dist_cutoffs = []
+    with torch.no_grad():
         xyz_arr = h5f.create_dataset("xyz_arr", (len(image_list)*args.number_of_points_per_image, 3), dtype='f4')
         distance2cam_arr = h5f.create_dataset("distance2cam_arr", (len(image_list)*args.number_of_points_per_image), dtype='f4')
         seg_arr = h5f.create_dataset("seg_arr", (len(image_list)*args.number_of_points_per_image), dtype='u1')
-        keep_masks = h5f.create_dataset("keep_masks", (len(image_list),  args.height,  args.width), dtype='u1')
+        keep_masks = h5f.create_dataset("keep_masks", (len(image_list), args.height, args.width), dtype='u1')
         depth_unc_arr = h5f.create_dataset("depth_unc_arr", (len(image_list)*args.number_of_points_per_image), dtype='f4')
         frame_index_arr = h5f.create_dataset("frame_index_arr", (len(image_list)*args.number_of_points_per_image), dtype='u2')
-
         cursor = 0
 
         for i in tqdm(range(len(poses))):
-
-            pose =  torch.tensor((poses[i])[:3]).float().to(device)
-
-
+            pose = torch.tensor((poses[i])[:3]).float().to(device)
             cam = EUCMCamera(torch.tensor(intrinsics[i]).unsqueeze(0).to(device), Tcw=Pose(T=1))
             depth_i_tensor = torch.tensor(depths[i]).to(device)
             coords = cam.reconstruct_depth_map(depth_i_tensor.unsqueeze(0).unsqueeze(0).to(device)).squeeze()
             coords = coords.reshape(3, -1)
             coords = (pose @ torch.cat([coords, torch.ones_like(coords[:1])], dim=0).reshape(4,-1)).T.cpu()
-
-
             dist_cutoffs.append(args.distance_thresh)
             keep_mask = depth_i_tensor.squeeze() < args.distance_thresh
             seg = torch.tensor(semantic_segmentation[i]).to(device)
 
-            #Exclude points on the 'edge' of objects, i.e. where the countours depth map varies a lot
-            # TODO Magic Numbers
             keep_mask = torch.logical_and(get_edgeness(depth_i_tensor) < 0.04, keep_mask)
             keep_mask[30:170,30:-30] = 0
             for class_name in ignore_classes:
@@ -369,100 +352,74 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
             keep_mask = expand_zeros(keep_mask)
             keep_mask = keep_mask.cpu().numpy()
             keep_masks[i] = keep_mask.astype(np.uint8)
-            keep_mask = keep_mask.reshape(-1)            
+            keep_mask = keep_mask.reshape(-1)
+
             valid_points = keep_mask.sum().item()
             random_selection = np.random.permutation(valid_points)[:args.number_of_points_per_image]
             offset = min(valid_points, args.number_of_points_per_image)
-
             xyz_arr[cursor:cursor+offset]=coords[keep_mask][random_selection]
-            distance2cam_arr[cursor:cursor+offset]=  depths[i].reshape(-1)[keep_mask][random_selection]
-
-
+            distance2cam_arr[cursor:cursor+offset]= depths[i].reshape(-1)[keep_mask][random_selection]
             seg_arr[cursor:cursor+offset] = semantic_segmentation[i].reshape(-1).astype(np.uint8)[keep_mask][random_selection]
             dunc = depth_uncertainties[i].reshape(-1)[keep_mask][random_selection]
             depth_unc_arr[cursor:cursor+offset]=dunc
             frame_index_arr[cursor:cursor+offset]= np.zeros_like(dunc, dtype=np.uint16)+i
-
             cursor += offset
-        
+
+    print("Filtering redundant points")
+    xyz_index_arr = map_3d(np.concatenate([
+        xyz_arr[:cursor],
+        distance2cam_arr[:cursor].reshape(-1,1),
+        np.arange(len(xyz_arr)).reshape(-1, 1)[:cursor]], axis=1),
+        get_closest_to_centroid_with_attributes_of_closest_to_cam, 0.003)
+    filtered_indices = xyz_index_arr[:, -1].astype(np.uint32)
+    return xyz_index_arr[:,:3], distance2cam_arr[:cursor][filtered_indices], seg_arr[:cursor][filtered_indices], frame_index_arr[:cursor][filtered_indices], depth_unc_arr[:cursor][filtered_indices], keep_masks, dist_cutoffs
 
 
-        print("Filtering redundant points")
-        xyz_index_arr = map_3d(np.concatenate([
-            xyz_arr[:cursor], 
-            distance2cam_arr[:cursor].reshape(-1,1), 
-            np.arange(len(xyz_arr)).reshape(-1, 1)[:cursor]], axis=1), get_closest_to_centroid_with_attributes_of_closest_to_cam, 0.003)
-        filtered_indices = xyz_index_arr[:, -1].astype(np.uint32)
-
-        return xyz_index_arr[:,:3], distance2cam_arr[:cursor][filtered_indices], seg_arr[:cursor][filtered_indices], frame_index_arr[:cursor][filtered_indices], depth_unc_arr[:cursor][filtered_indices], keep_masks, dist_cutoffs
-        
-    
-def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_per_volume, tsdf_overlap,dist_cutoffs): 
+def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_per_volume, tsdf_overlap,dist_cutoffs):
     # TODO Magic Numbers
     xyz = []
     rgb = []
-
-
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=0.3 / 512.0, 
+        voxel_length=0.3 / 512.0,
         sdf_trunc=0.035,
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
     totensor = torchvision.transforms.ToTensor()
-
     mask_out_background = np.ones_like(masks[0].astype(np.float32))
     intrinsics = torch.tensor(intrinsics).float()
-
-    #TODO: Magic numbers
-    mask_out_background[:170,80:-80] *= 0 
+    mask_out_background[:170,80:-80] *= 0
     for i in tqdm(range(len(poses))):
-    
         if i > len(poses)-10:
             mask_out_background = np.ones_like(masks[0])
-
-        # Rectify to linear intrinsics
         projected_img, projected_mask, projected_depth = rectify_eucm(
-            totensor(Image.open(img_list[i])).unsqueeze(0), 
+            totensor(Image.open(img_list[i])).unsqueeze(0),
             torch.tensor(masks[i].astype(np.float32)*mask_out_background).unsqueeze(0).unsqueeze(0).float(),
-            torch.tensor(depths[i]).unsqueeze(0).unsqueeze(0), 
+            torch.tensor(depths[i]).unsqueeze(0).unsqueeze(0),
             intrinsics[i]
         )
-
         depth = o3d.geometry.Image(projected_depth*projected_mask)
         color = o3d.geometry.Image(np.ascontiguousarray(projected_img.transpose(1, 2, 0)*255.).astype(np.uint8))
-
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color, depth, depth_trunc=dist_cutoffs[i], convert_rgb_to_intensity=False, depth_scale=1)
-        
         volume.integrate(
             rgbd,
             o3d.camera.PinholeCameraIntrinsic(
-            width= args.width,
-            height= args.height,
-            fx=intrinsics[i][0],
-            fy=intrinsics[i][1],
-            cx=intrinsics[i][2],
-            cy=intrinsics[i][3],
-        ),
-            np.linalg.inv(poses[i]))
+                width= args.width, height= args.height,
+                fx=intrinsics[i][0], fy=intrinsics[i][1],
+                cx=intrinsics[i][2], cy=intrinsics[i][3],
+            ), np.linalg.inv(poses[i]))
         if (i % frames_per_volume) == (frames_per_volume - tsdf_overlap):
             volume2 = o3d.pipelines.integration.ScalableTSDFVolume(
-                voxel_length=0.3 / 512.0, 
+                voxel_length=0.3 / 512.0,
                 sdf_trunc=0.015,
-                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
-            )
-
+                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8 )
         if i % frames_per_volume >= (frames_per_volume - tsdf_overlap):
             volume2.integrate(
                 rgbd,
                 o3d.camera.PinholeCameraIntrinsic(
-                width= args.width,
-                height= args.height,
-                fx=intrinsics[i][0],
-                fy=intrinsics[i][1],
-                cx=intrinsics[i][2],
-                cy=intrinsics[i][3],
-            ),
-            np.linalg.inv(poses[i]))
+                    width= args.width, height= args.height,
+                    fx=intrinsics[i][0], fy=intrinsics[i][1],
+                    cx=intrinsics[i][2], cy=intrinsics[i][3],
+                ), np.linalg.inv(poses[i]))
         if (i % frames_per_volume) == frames_per_volume - 1:
             pc = volume.extract_point_cloud()
             pc = volume.extract_point_cloud()
@@ -474,9 +431,10 @@ def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_
     xyz.append(np.array(pc.points))
     rgb.append((np.array(pc.colors)*255).astype(np.uint8))
     return np.concatenate(xyz), np.concatenate(rgb)
- 
+
 
 def benthic_cover_analysis(pc, label_to_class, ignore_classes_in_benthic_cover, bins=1000):
+    #step 1: fit PCA
     pca = PCA(n_components=2)
     pca.fit(pc[['x','y', 'z']].values)
     x_axis = pca.components_[0]
@@ -487,13 +445,9 @@ def benthic_cover_analysis(pc, label_to_class, ignore_classes_in_benthic_cover, 
     transformed = np.dot(pc[['x','y', 'z']].values, transformation_matrix)
     transformed -= np.min(transformed, axis=0)
     xmax, ymax, zmax = np.max(transformed, axis=0)
-
     discretization = xmax / bins
-    discretization = float(max(discretization, 1e-3))  # safeguard
-
-    pcarr = np.concatenate([transformed, pc.drop(columns=["x", "y", "z"]).values], axis=1).astype(float)
+    pcarr = np.concatenate([transformed, pc.drop(columns=["x", "y", "z"]).values], axis=1)
     out = aggregate_2d_grid(pcarr, size=discretization)
-
     xcoords = out[:,0].astype(np.int32)
     ycoords = out[:,1].astype(np.int32)
     img = np.zeros((xcoords.max()+1, ycoords.max()+1, 12))
@@ -509,6 +463,7 @@ def benthic_cover_analysis(pc, label_to_class, ignore_classes_in_benthic_cover, 
     all_classes = all_classes.sum()
     percentage_covers = {k: v / all_classes for k,v in percentage_covers.items()}
     return img, percentage_covers
+
 
 if __name__ == "__main__":
     main(args)

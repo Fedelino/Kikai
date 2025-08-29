@@ -74,64 +74,109 @@ def get_edgeness(x):
     return edgeness
 
 
-def aggregate_2d_grid(inp, size):
-    """ Builds a 2D Grid along the two principal components of the point cloud 
-    in each grid element, the points in the point cloud are aggregated to give a final 
-    semantic class, height, and color"""
-    to_bin = np.floor(inp[:, 0:2] / size).astype(np.int32)
-    inds = np.lexsort(np.transpose(to_bin)[::-1])
-    to_bin = to_bin[inds]
-    inp = inp[inds]
+def aggregate_2d_grid(inp: np.ndarray, size: float) -> np.ndarray:
+    """
+    Builds a 2D grid along inp[:,0:2] with bin size `size`, aggregates each cell:
+      - 1 point  -> keep it, count=1
+      - 2 points -> keep the one with higher z (col 2), count=2
+      - >=3      -> drop rows with z < mean(z), then:
+                     x,y from first row in the kept set (same per bin),
+                     z,r,g,b,dist,frame_idx,depth_unc are means,
+                     class is the statistical mode,
+                     class_rgb comes from first row with that class,
+                     count is original number of points in the bin.
+    Returns an array with columns:
+      [bin_x, bin_y, z, r, g, b, distance_to_cam, class, class_r, class_g, class_b, frame_index, depth_unc, count]
+    Then scales bin_x/bin_y by 1/size to match your original behavior.
+    """
+    # Guard against bad bin sizes
+    if not np.isfinite(size) or size <= 0:
+        span = np.ptp(inp[:, 0]) if inp.size else 1.0
+        size = max(span / 1000.0, 1e-9)
+
+    # Integer bin indices for the first two columns
+    to_bin = np.floor(inp[:, 0:2] / size).astype(np.int64)
+
+    # Sort so equal bins are contiguous
+    order = np.lexsort((to_bin[:, 1], to_bin[:, 0]))
+    bins_sorted = to_bin[order]
+    data_sorted = inp[order]
+
+    if bins_sorted.shape[0] == 0:
+        return np.empty((0, inp.shape[1] + 1), dtype=inp.dtype)
+
+    # Find group boundaries (run-length encoding)
+    changes = np.any(np.diff(bins_sorted, axis=0) != 0, axis=1)
+    boundaries = np.nonzero(np.concatenate(([True], changes, [True])))[0]
+
+    rows = []
+    for s, e in zip(boundaries[:-1], boundaries[1:]):
+        group = data_sorted[s:e]
+        cnt = e - s
+        bx, by = bins_sorted[s]  # bin indices (integers)
+
+        if cnt == 1:
+            one = group[0]
+            row = np.concatenate([
+                np.array([bx, by], dtype=one.dtype),
+                one[2:],                      # keep original features from col 2 onward
+                np.array([1], dtype=one.dtype)
+            ])
+            rows.append(row)
+            continue
+
+        if cnt == 2:
+            chosen = group[np.argmax(group[:, 2])]
+            row = np.concatenate([
+                np.array([bx, by], dtype=chosen.dtype),
+                chosen[2:],
+                np.array([2], dtype=chosen.dtype)
+            ])
+            rows.append(row)
+            continue
+
+        # cnt >= 3 → filter by height >= mean
+        z = group[:, 2]
+        keep_mask = z >= z.mean()
+        kept = group[keep_mask]
+        if kept.shape[0] == 0:
+            # Fallback: behave like single-point case with the first row
+            one = group[0]
+            row = np.concatenate([
+                np.array([bx, by], dtype=one.dtype),
+                one[2:],
+                np.array([1], dtype=one.dtype)
+            ])
+            rows.append(row)
+            continue
+
+        # Unpack columns (names for clarity)
+        # Expect columns: x,y,z,r,g,b,dist,cls,cr,cg,cb,frame_idx,depth_unc
+        x, y, z, r, g, b, dist, cls, cr, cg, cb, frame_idx, d_unc = kept.T
+
+        # Mode class
+        mc = mode(cls, keepdims=False)[0]
+        mc_mask = (cls == mc)
+        mc_r = cr[mc_mask][0]
+        mc_g = cg[mc_mask][0]
+        mc_b = cb[mc_mask][0]
+
+        agg = np.array([
+            bx, by,              # bin indices
+            z.mean(),            # mean height
+            r.mean(), g.mean(), b.mean(),
+            dist.mean(),         # mean distance to camera
+            mc,                  # most common class
+            mc_r, mc_g, mc_b,    # class color
+            frame_idx.mean(),    # mean frame index
+            d_unc.mean(),        # mean depth uncertainty
+            cnt                  # ORIGINAL number of points in this bin
+        ], dtype=kept.dtype)
+        rows.append(agg)
+
+    out = np.vstack(rows)
     
-    def aggregate_2d_grid_cell(group):
-        # If only one point in grid element, return this one point, set the counter of points in grid element to 1
-        if len(group) == 1:
-            return np.concatenate([group, np.array([[1]])], axis=1)
-        # If two points in grid element, return the one with higher z value, set counter of points in grid element to 2
-        if len(group) == 2:
-            return np.concatenate([group[np.argmax(group[:,2])], np.array([2])]).reshape(1, -1)
-        # If more than two points in grid element, discard points below the mean height
-        z = group[:,2]
-        mean_height = z.mean()
-
-        #TODO doublecheck orientation of z axis
-        group_ = group[z >= mean_height]
-        if len(group_) == 0:
-            return np.concatenate([group[:1], np.array([[1]])], axis=1)
-        x, y, z, r, g, b, distance_to_cam, class_, class_r, class_g, class_b, frame_index, depth_unc = group_.T
-        
-        most_common_class = mode(class_, keepdims=False)[0]
-
-        class_r = class_r[class_==most_common_class][0]
-        class_g = class_g[class_==most_common_class][0]
-        class_b = class_b[class_==most_common_class][0]
-
-        return np.array([[
-            x[0], # Is the same for all points in group
-            y[0], # Is the same for all points in group
-            np.mean(z), # Height is calculated as mean
-            np.mean(r), # Color is calculated as mean
-            np.mean(g), # Color is calculated as mean
-            np.mean(b), # Color is calculated as mean
-            np.mean(distance_to_cam), # Distance to camera is calculated as mean
-            most_common_class, # Class is the most common class
-            class_r, # Class color is the color of most common class 
-            class_g, # Class color is the color of most common class
-            class_b, # Class color is the color of most common class
-            np.mean(frame_index), # Frame index is calculated as mean
-            np.mean(depth_unc), # Depth uncertainty is calculated as mean
-            len(group) # Number of points in 2D Grid element
-        ]])
-
-    
-    del inds
-    splits = np.split(inp, np.cumsum(np.unique(to_bin, return_counts=True, axis=0)[1])[:-1])
-    del to_bin
-    del inp
-    results = np.concatenate([inp for inp in np.vectorize(aggregate_2d_grid_cell, otypes=[np.ndarray])(splits) if len(inp)>0], axis=0)
-    results[:,0] /= size
-    results[:,1] /= size
-    return results
+    return out
 
 def get_legend(class_to_colors, tmp_dir):
     
