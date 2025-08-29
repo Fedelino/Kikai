@@ -137,8 +137,31 @@ class RandomScaleCrop(object):
     
 
 class ResizeImagesOnly(object):
-    def __init__(self, size):
+    def __init__(self, size):           # size = (H, W)
+        self.out_h, self.out_w = size
         self.resize = torchvision.transforms.Resize(size)
+
     def __call__(self, images, intrinsics):
+        # original size
+        if hasattr(images[0], "size"):      # PIL
+            in_w, in_h = images[0].size
+        elif hasattr(images[0], "shape"):   # np/torch
+            in_h, in_w = images[0].shape[-2:]
+        else:
+            raise TypeError("Unknown image type")
+
+        sx = self.out_w / float(in_w)
+        sy = self.out_h / float(in_h)
+
         images_resized = [self.resize(img) for img in images]
-        return images_resized, intrinsics
+
+        if intrinsics is not None:
+            K = intrinsics.clone() if torch.is_tensor(intrinsics) else np.copy(intrinsics)
+            K[0, 0] *= sx  # fx
+            K[1, 1] *= sy  # fy
+            K[0, 2] *= sx  # cx
+            K[1, 2] *= sy  # cy
+        else:
+            K = intrinsics
+
+        return images_resized, K

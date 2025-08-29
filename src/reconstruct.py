@@ -1,4 +1,3 @@
-import argparse
 import os
 import numpy as np
 import torch
@@ -7,7 +6,7 @@ import torchvision.transforms.functional as F
 from PIL import Image
 import pandas as pd
 import torch.nn as nn
-from time import time 
+from time import time
 import segmentation_models_pytorch as smp
 import segmentation
 from sfm.model import SfMModel
@@ -17,14 +16,14 @@ from tqdm import tqdm
 import h5py
 import open3d as o3d
 from sklearn.decomposition import PCA
-from reconstruction_utils import get_closest_to_centroid_with_attributes_of_closest_to_cam, map_3d, get_matching_indices, get_rotation_matrix_to_align_pose_with_gravity, get_edgeness, aggregate_2d_grid
+from reconstruction_utils import get_closest_to_centroid_with_attributes_of_closest_to_cam, map_3d, get_matching_indices, get_rotation_matrix_to_align_pose_with_gravity, get_edgeness
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 from sfm.inverse_warp import EUCMCamera, Pose, pose_vec2mat, rectify_eucm
 import scipy
 import json
-
 import sys
 sys.path.append('/home/jonathan/mee-deepreefmap/src/ffmpeg-7.0.2-amd64-static/ffmpeg')
+import argparse
 
 # Start by parsing args
 parser = argparse.ArgumentParser(description='Reconstruct a 3D model from a video')
@@ -32,8 +31,8 @@ parser.add_argument('--input_video', type=str, help='Path to video file - can be
 parser.add_argument('--out_dir', type=str, default='out', help='Path to output directory - will be created if does not exist')
 parser.add_argument('--tmp_dir', type=str, default='tmp', help='Path to temporary directory - will be created if does not exist')
 parser.add_argument('--timestamp', type=str, help='Begin and End timestamp of the transect. In case multiple videos are supplied, the format should be comma separated e.g. of the form "0:23-end,begin-1:44"')
-parser.add_argument('--sfm_checkpoint', type=str, default='../sfm_net.pth', help='Path to the sfm_net checkpoint')
-parser.add_argument('--segmentation_checkpoint', type=str, default='../segmentation_net.pth', help='Path to the segmentation_net checkpoint')
+parser.add_argument('--sfm_checkpoint', type=str, default='./kikai_best.pth', help='Path to the sfm_net checkpoint')
+parser.add_argument('--segmentation_checkpoint', type=str, default='./segmentation_net.pth', help='Path to the segmentation_net checkpoint')
 parser.add_argument('--height', type=int, default=384, help='Height in pixels to which input video is scaled')
 parser.add_argument('--width', type=int, default=640, help='Width in pixels to which input video is scaled')
 parser.add_argument('--seg_height', type=int, default=384*2, help='Height in pixels to which input video is scaled')
@@ -46,71 +45,48 @@ parser.add_argument('--tsdf_overlap', type=int, default=100, help='Overlap in fr
 parser.add_argument('--distance_thresh', type=float, default=0.2, help='Distance threshold for points added to cloud')
 parser.add_argument('--ignore_classes_in_point_cloud', type=str, default="background,fish,human", help='Classes to ignore when adding points to cloud')
 parser.add_argument('--ignore_classes_in_benthic_cover', type=str, default="background,fish,human,transect tools,transect line,dark", help='Classes to ignore when calculating benthic cover percentages')
-parser.add_argument('--intrinsics_file', type=str, default="../example_inputs/intrinsics_eucm.json", help='Path to intrinsics file')
-parser.add_argument('--class_to_label_file', type=str, default="../example_inputs/class_to_label.json", help='Path to label_to_class_file')
-parser.add_argument('--class_to_color_file', type=str, default="../example_inputs/class_to_color.json", help='Path to class_to_color_file')
+parser.add_argument('--intrinsics_file', type=str, default="./seg_data/intrinsics_eucm.json", help='Path to intrinsics file')
+parser.add_argument('--class_to_label_file', type=str, default="./seg_data/class_to_label.json", help='Path to label_to_class_file')
+parser.add_argument('--class_to_color_file', type=str, default="./seg_data/class_to_color.json", help='Path to class_to_color_file')
 parser.add_argument('--output_2d_grid_size', type=int, default=2000, help='Size of the 2D grid used for benthic cover analysis - a higher grid size will produce higher resolution outputs but takes longer to compute and may have empty grid cells')
 parser.add_argument('--buffer_size', type=int, default=2, help='Number of frames to use for temporal smoothing')
 parser.add_argument('--render_video', action='store_true', help='Whether to render output 4-panel video')
 args = parser.parse_args()
 
+
 def main(args):
-
     t = time()
-
     with open(args.class_to_color_file) as f:
         class_to_color = {k: (np.array(v)).astype(np.uint8) for k,v in json.load(f).items()}
     with open(args.class_to_label_file) as f:
         class_to_label = json.load(f)
-        label_to_class = {v:k for k,v in class_to_label.items()}
+    label_to_class = {v:k for k,v in class_to_label.items()}
     label_to_color = {k: class_to_color[v] for k,v in label_to_class.items()}
- 
-
     grav = extract_frames_and_gopro_gravity_vector(
-        args.input_video.split(","), 
-        args.timestamp.split(","), 
-        args.seg_width, 
-        args.seg_height, 
-        args.fps, 
+        args.input_video.split(","),
+        args.timestamp.split(","),
+        args.seg_width,
+        args.seg_height,
+        args.fps,
         args.tmp_dir,
         args.reverse,
     )
     print("Extracted Frames And Gravity Vector in", time() - t, "seconds")
-    
-
     h5f = h5py.File(args.tmp_dir + '/tmp.hdf5', 'w')
-    
     img_list = [args.tmp_dir + "/rgb/" +file for file in sorted(os.listdir(args.tmp_dir + "/rgb")) if "jpg" in file]
     print("Running Neural Networks ...")
-    
     depths, depth_uncertainties, poses, semantic_segmentation, intrinsics = get_nn_predictions(
-        img_list, 
-        grav, 
-        len(class_to_label) + 1,
-        h5f,
-        args,
+        img_list, grav, len(class_to_label) + 1, h5f, args,
     )
-
     print("Ran NN Predictions in ", time() - t, "seconds")
     print("Building Point Cloud ...")
     os.makedirs(args.out_dir + "/videos", exist_ok=True)
     xyz_index_arr, distance2cam_arr, seg_arr, frame_index_arr, depth_unc_arr, keep_masks, dist_cutoffs = get_point_cloud(
-        img_list, 
-        depths, 
-        poses, 
-        depth_uncertainties, 
-        semantic_segmentation, 
-        intrinsics,
-        label_to_color, 
-        class_to_label,
-        h5f,
-        args
+        img_list, depths, poses, depth_uncertainties, semantic_segmentation, intrinsics, label_to_color, class_to_label, h5f, args
     )
-
     print("Integrating TSDF!")
     tsdf_xyz, tsdf_rgb = tsdf_point_cloud(img_list, depths, keep_masks, poses, intrinsics, np.mean(depths), args.frames_per_volume, args.tsdf_overlap, dist_cutoffs)
     print("Integrated TSDF Point Cloud in ", time() - t, "seconds")
-
     idx = get_matching_indices(tsdf_xyz, xyz_index_arr)
     print("Matched TSDF to Point Cloud in ", time() - t, "seconds")
     rgb_seg_arr = np.vectorize(lambda k: label_to_color[k], signature='()->(n)')(seg_arr[idx])
@@ -125,27 +101,24 @@ def main(args):
         'class': seg_arr[idx],
         'class_r': rgb_seg_arr[:,0],
         'class_g': rgb_seg_arr[:,1],
-        'class_b': rgb_seg_arr[:,2], 
+        'class_b': rgb_seg_arr[:,2],
         'frame_index': frame_index_arr[idx],
         'depth_uncertainty': depth_unc_arr[idx],
-    }) 
+    })
     tsdf_pc.to_csv(args.out_dir + "/point_cloud_tsdf.csv", index=False)
     print("Saved TSDF Point Cloud in ", time() - t, "seconds")
-
-
     print("Starting Benthic Cover Analsysis after ", time() - t, "seconds")
     results, percentage_covers = benthic_cover_analysis(tsdf_pc, label_to_class, args.ignore_classes_in_benthic_cover.split(","), bins=args.output_2d_grid_size)
     np.save(args.out_dir + "/results.npy", results)
     json.dump(percentage_covers, open(args.out_dir + "/percentage_covers.json", "w"))
     print("Finished Benthic Cover Analysis in ", time() - t, "seconds")
-
     os.system("cp "+args.class_to_color_file+" "+ args.out_dir)
     if args.render_video:
         os.system("cp "+args.tmp_dir+"/*_.mp4 "+ args.out_dir + "/videos")
         render_video(img_list, depths, semantic_segmentation, results, args.fps, class_to_label, label_to_color, args.tmp_dir, args.reverse)
         os.system("mv " + args.tmp_dir + "/out.mp4 " + args.out_dir + "/videos")
         print("Rendered Video in ", time() - t, "seconds")
-    return 
+    return
 
 
 def reset_batchnorm_layers(model):
@@ -161,19 +134,62 @@ def change_bn_momentum(model, new_value):
 
 
 def expand_zeros(mask):
-    # Add an extra batch dimension and channel dimension to the mask for convolution
-    mask = mask.unsqueeze(0).unsqueeze(0).float()  # Shape: 1x1xHxW
-
-    # Define a 3x3 kernel filled with ones
+    mask = mask.unsqueeze(0).unsqueeze(0).float()
     kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=mask.device)
-
-    # Perform 2D convolution with padding=1 to keep the same output size
     conv_result = torch.nn.functional.conv2d(mask, kernel, padding=1)
-
-    # Any place where the convolution result is less than 9 means it had a zero in the neighborhood
     result_mask = (conv_result == 9).squeeze().bool()
-
     return result_mask
+
+def aggregate_2d_grid(inp, size):
+    """Builds a 2D grid along the two principal components of the point cloud and
+    aggregates per-cell height/color/class."""
+    to_bin = np.floor(inp[:, 0:2] / size).astype(np.int32)
+    inds = np.lexsort(np.transpose(to_bin)[::-1])
+    to_bin = to_bin[inds]
+    inp = inp[inds]
+
+    def aggregate_2d_grid_cell(group):
+        if len(group) == 1:
+            return np.concatenate([group, np.array([[1]])], axis=1)
+        if len(group) == 2:
+            return np.concatenate([group[np.argmax(group[:, 2])], np.array([2])]).reshape(1, -1)
+        z = group[:, 2]
+        mean_height = z.mean()
+        group_ = group[z >= mean_height]
+        if len(group_) == 0:
+            return np.concatenate([group[:1], np.array([[1]])], axis=1)
+        x, y, z, r, g, b, distance_to_cam, class_, class_r, class_g, class_b, frame_index, depth_unc = group_.T
+        from scipy.stats import mode
+        most_common_class = mode(class_, keepdims=False)[0]
+        class_r = class_r[class_ == most_common_class][0]
+        class_g = class_g[class_ == most_common_class][0]
+        class_b = class_b[class_ == most_common_class][0]
+        return np.array([[
+            x[0], y[0], np.mean(z),
+            np.mean(r), np.mean(g), np.mean(b),
+            np.mean(distance_to_cam),
+            most_common_class, class_r, class_g, class_b,
+            np.mean(frame_index), np.mean(depth_unc),
+            len(group)
+        ]])
+
+    counts = np.unique(to_bin, return_counts=True, axis=0)[1]
+    split_idx = np.cumsum(counts)[:-1]
+    splits = np.split(inp, split_idx)
+
+    cells = []
+    for group in splits:
+        arr = aggregate_2d_grid_cell(group)
+        if arr is not None and len(arr) > 0:
+            cells.append(arr)
+
+    if len(cells) == 0:
+        return np.empty((0, 14), dtype=float)
+
+    results = np.concatenate(cells, axis=0)
+    results[:, 0] /= size
+    results[:, 1] /= size
+    return results
 
 def get_nn_predictions(img_list, grav, num_classes, h5f, args):
     totensor = torchvision.transforms.ToTensor()
@@ -461,41 +477,33 @@ def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_
  
 
 def benthic_cover_analysis(pc, label_to_class, ignore_classes_in_benthic_cover, bins=1000):
-    #step 1: fit PCA
     pca = PCA(n_components=2)
-    pca.fit(pc[['x','y', 'z']].values)  
-    x_axis = pca.components_[0]  # Estimated x-axis
-    y_axis = pca.components_[1]  # Estimated y-axis
-
-    # Step 2: Calculate the normal vector to the x-y plane as the z-axis
+    pca.fit(pc[['x','y', 'z']].values)
+    x_axis = pca.components_[0]
+    y_axis = pca.components_[1]
     z_axis = np.cross(x_axis, y_axis)
     z_axis /= np.linalg.norm(z_axis)
-
-    # Step 3: Create the transformation matrix
     transformation_matrix = np.vstack((x_axis, y_axis, z_axis)).T
-
-    # Now, you can apply this transformation matrix to your point cloud
-    transformed = np.dot(pc[['x','y', 'z']].values, transformation_matrix)  
+    transformed = np.dot(pc[['x','y', 'z']].values, transformation_matrix)
     transformed -= np.min(transformed, axis=0)
     xmax, ymax, zmax = np.max(transformed, axis=0)
-    
+
     discretization = xmax / bins
-    pcarr = np.concatenate([transformed, pc.drop(columns=["x", "y", "z"]).values], axis=1)
+    discretization = float(max(discretization, 1e-3))  # safeguard
+
+    pcarr = np.concatenate([transformed, pc.drop(columns=["x", "y", "z"]).values], axis=1).astype(float)
     out = aggregate_2d_grid(pcarr, size=discretization)
 
     xcoords = out[:,0].astype(np.int32)
     ycoords = out[:,1].astype(np.int32)
-
     img = np.zeros((xcoords.max()+1, ycoords.max()+1, 12))
-    
     img[xcoords, ycoords] = out[:,2:]
-    
     percentage_covers = {}
     benthic_class = out[:,7].astype(np.uint8)
     all_classes = (benthic_class!=0)
     for class_label, class_name in label_to_class.items():
         if class_name not in ignore_classes_in_benthic_cover:
-            percentage_covers[class_name] = (benthic_class==class_label).sum() 
+            percentage_covers[class_name] = (benthic_class==class_label).sum()
         else:
             all_classes = np.logical_and(all_classes, benthic_class!=class_label)
     all_classes = all_classes.sum()
