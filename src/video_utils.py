@@ -92,67 +92,127 @@ def get_gravity_vectors(video, timestamp, number_of_frames):
     return grav
 
 def render_video(img_list, depths, semantic_segmentation, results_npy, fps, class_to_label, label_to_color, tmp_dir, reverse):
-    """Renders a video from the given images, depths, semantic_segmentation and 2d maps."""
-    os.makedirs(tmp_dir + "/render", exist_ok=True)
-    
-    # For visualization, its nicer when depths are scaled between 0 and 1, and sqrt_scaled
+    """Renders a 4-panel video (RGB, RGB+Depth, RGB+Seg, 2D map) with size-safe overlays."""
+    import os
+    from PIL import Image
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+    import cv2
+
+    os.makedirs(os.path.join(tmp_dir, "render"), exist_ok=True)
+
+    # ----- Stable depth normalization (global per-clip) -----
+    # depths: list/array of (H0,W0); keep a copy for masking, etc.
+    depths = np.asarray(depths)  # (N,H0,W0)
     q2, q98 = np.nanquantile(depths, [0.02, 0.98])
     depths = np.nan_to_num(depths, nan=q2)
     depths = np.clip(depths, q2, q98)
-    depths = np.clip(depths, q2, 0.35)
-    depths_ = np.sqrt(depths)
-    depths_ = (depths_ - np.min(depths_)/2) / (np.max(depths_)-np.min(depths_)/2)
-    #depths_ = depths_ / np.max(depths_)
+    # perceptual tweak
+    depths = np.sqrt(depths)
+    # normalize to 0..1 using global clip (avoid per-frame blowout)
+    d_min = depths.min()
+    d_max = depths.max()
+    depths_norm = (depths - d_min) / (d_max - d_min + 1e-8)  # (N,H0,W0), 0..1
 
+    # ----- Legend / colors for segmentation & 2D map -----
+    class_to_color = {cls_name: label_to_color[cls_label] for cls_name, cls_label in class_to_label.items()}
+    legend = get_legend(class_to_color, tmp_dir)  # float 0..1, shape ~ (h,w,3)
 
-    class_to_color = {class_name: label_to_color[class_label] for class_name, class_label in class_to_label.items()}
-    legend = get_legend(class_to_color, tmp_dir)
+    # 2D map inputs
+    final_rgb       = results_npy[:, :, 1:4]   # (Hmap, Wmap, 3), uint8
+    final_class_rgb = results_npy[:, :, 6:9]   # (Hmap, Wmap, 3), uint8
+    frame_index     = results_npy[:, :, 9:10].astype(np.int16)  # (Hmap, Wmap, 1)
 
-    final_rgb = results_npy[:,:,1:4]
-    final_class_rgb = results_npy[:,:,6:9]
-    frame_index = results_npy[:,:,9:10].astype(np.int16)
+    # utility: blend two uint8 RGB images with weights a,b (expects same size)
+    def blend_uint8(a, b, wa, wb):
+        af = a.astype(np.float32) / 255.0
+        bf = b.astype(np.float32) / 255.0
+        out = wa * af + wb * bf
+        return (np.clip(out, 0, 1) * 255).astype(np.uint8)
 
+    # Prepare legend width relative to the map panel (we'll resize once we know display size)
+    legend_u8 = (np.clip(legend, 0, 1) * 255).astype(np.uint8)
 
-    for i in tqdm(range(len(depths))):
+    N = len(depths_norm)
+    for i in tqdm(range(N)):
+        # ---------- Load RGB display frame (we use 640x384 for display) ----------
+        rgb = np.array(Image.open(img_list[i]).resize((640, 384)))  # uint8, (H,W,3)
+        H, W = rgb.shape[:2]
 
-
-        color_semseg = np.zeros((semantic_segmentation.shape[1], semantic_segmentation.shape[2], 3), dtype=np.uint8)
+        # ---------- Build segmentation color overlay ----------
+        # map labels to colors
+        seg = semantic_segmentation[i]  # (H0,W0) label ids
+        color_semseg = np.zeros((seg.shape[0], seg.shape[1], 3), dtype=np.uint8)
         for class_name, class_label in class_to_label.items():
-            color_semseg[semantic_segmentation[i]==class_label] = label_to_color[class_label]
+            color_semseg[seg == class_label] = label_to_color[class_label]
+        # resize segmentation to display size
+        seg_u8 = cv2.resize(color_semseg, (W, H), interpolation=cv2.INTER_NEAREST)
+        seg_panel = blend_uint8(rgb, seg_u8, 0.3, 0.7)  # (H,W,3) uint8
 
+        # ---------- Mask fish/human depth to 0 before visualization ----------
+        d = depths_norm[i].copy()  # (H0,W0), float 0..1
+        if 'fish' in class_to_label:
+            d[seg == class_to_label['fish']] = 0.0
+        if 'human' in class_to_label:
+            d[seg == class_to_label['human']] = 0.0
 
-        depths_[i][semantic_segmentation[i]==class_to_label['fish']] = 0
-        depths_[i][semantic_segmentation[i]==class_to_label['human']] = 0
+        # match depth to display size
+        if d.shape != (H, W):
+            d = cv2.resize(d, (W, H), interpolation=cv2.INTER_LINEAR)  # (H,W) float 0..1
 
+        # colorize depth and blend with RGB
+        depth_rgb = (plt.cm.seismic(d)[..., :3] * 255).astype(np.uint8)  # (H,W,3) uint8
+        depth_overlay = blend_uint8(rgb, depth_rgb, 0.2, 0.8)            # (H,W,3) uint8
 
-        rgb = np.array(Image.open(img_list[i]).resize((640, 384)))/255.
+        # ---------- Build the rolling 2D map panel ----------
+        # indicator for frames "seen" so far
         if reverse:
             ind = (frame_index >= i).astype(np.uint8)
         else:
             ind = (frame_index <= i).astype(np.uint8)
-        
-        results_npy_rgb = final_rgb * ind
-        results_npy_class_rgb = final_class_rgb * ind
-        if results_npy_rgb.shape[0]<results_npy_rgb.shape[1]:
-            results_npy_rgb = np.concatenate([results_npy_rgb,results_npy_class_rgb],axis=0)
+
+        results_rgb      = (final_rgb * ind).astype(np.uint8)       # (Hmap,Wmap,3)
+        results_classrgb = (final_class_rgb * ind).astype(np.uint8) # (Hmap,Wmap,3)
+
+        # stack map + class map either vertically or horizontally depending on aspect
+        if results_rgb.shape[0] < results_rgb.shape[1]:
+            map_stack = np.concatenate([results_rgb, results_classrgb], axis=0)
         else:
-            results_npy_rgb = np.concatenate([results_npy_rgb,results_npy_class_rgb],axis=1)
+            map_stack = np.concatenate([results_rgb, results_classrgb], axis=1)
+
+        # prepend legend on the left (scale legend height to map height)
+        # first ensure legend height matches map height
         if i == 0:
-            ratio = legend.shape[0] / results_npy_rgb.shape[0]
-            legend = resize(legend, (round(legend.shape[0]/ratio), round(legend.shape[1]/ratio)))
-        results_npy_rgb = np.concatenate([legend, results_npy_rgb/255.], axis=1).transpose(1, 0, 2)
-        results_npy_rgb = resize(results_npy_rgb, rgb.shape[:2])
-        resize_ratio = results_npy_rgb.shape[1]/rgb.shape[1]
-        results_npy_rgb = resize(results_npy_rgb, (round(results_npy_rgb.shape[0]/resize_ratio), round(results_npy_rgb.shape[1]/resize_ratio)))
-        image = np.concatenate([
-            np.concatenate([rgb, 0.2 * rgb + 0.8 * plt.cm.seismic(depths_[i])[:,:,:3]], axis=0),
-            np.concatenate([0.3 * rgb + 0.7 * color_semseg.astype(np.float32)/255., 
-                            results_npy_rgb], axis=0),
-        ], axis=1)
-        if reverse:
-            plt.imsave(tmp_dir + "/render/" + str(len(depths)+1 - i).zfill(7)+".jpg", image)    
-        else:
-            plt.imsave(tmp_dir + "/render/" + str(i).zfill(7)+".jpg", image)
-       
-    os.system("ffmpeg  -hide_banner -loglevel error -framerate "+str(fps)+" -pattern_type glob -i '"+tmp_dir+"/render/*.jpg' \
-          -c:v libx264 -pix_fmt yuv420p "+tmp_dir+"/out.mp4")
+            # scale legend to ~10% of map height (tweak if you like)
+            target_legend_h = max(32, int(0.1 * map_stack.shape[0]))
+            scale = target_legend_h / legend_u8.shape[0]
+            legend_u8 = cv2.resize(legend_u8, (int(legend_u8.shape[1] * scale), target_legend_h), interpolation=cv2.INTER_LINEAR)
+
+        # pad/crop legend height to map height
+        if legend_u8.shape[0] != map_stack.shape[0]:
+            legend_u8 = cv2.resize(legend_u8, (legend_u8.shape[1], map_stack.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+        map_with_legend = np.concatenate([legend_u8, map_stack], axis=1)  # (Hmap, Wlegend+Wmap, 3)
+
+        # finally, resize 2D map panel to match display (H,W)
+        map_panel = cv2.resize(map_with_legend, (W, H), interpolation=cv2.INTER_LINEAR).astype(np.uint8)
+
+        # ---------- Compose 2×2 panel ----------
+        top    = np.concatenate([rgb,       seg_panel],     axis=1)  # (H, 2W, 3)
+        bottom = np.concatenate([depth_overlay, map_panel], axis=1)  # (H, 2W, 3)
+        image  = np.concatenate([top, bottom], axis=0)               # (2H, 2W, 3)
+
+        # ---------- Save frame ----------
+        fname = f"{(N + 1 - i):07d}.jpg" if reverse else f"{i:07d}.jpg"
+        plt.imsave(os.path.join(tmp_dir, "render", fname), image)
+
+    # ---------- Encode video ----------
+    os.system(
+        "ffmpeg -hide_banner -loglevel error -framerate {fps} -pattern_type glob "
+        "-i '{frames}' -c:v libx264 -pix_fmt yuv420p {out}".format(
+            fps=fps,
+            frames=os.path.join(tmp_dir, "render", "*.jpg"),
+            out=os.path.join(tmp_dir, "out.mp4"),
+        )
+    )

@@ -42,7 +42,7 @@ parser.add_argument('--reverse', action='store_true', help='Whether the transect
 parser.add_argument('--number_of_points_per_image', type=int, default=2000, help='Number of points to sample from each image')
 parser.add_argument('--frames_per_volume', type=int, default=500, help='Number of frames per TSDF Volume')
 parser.add_argument('--tsdf_overlap', type=int, default=100, help='Overlap in frames over TSDF Volumes')
-parser.add_argument('--distance_thresh', type=float, default=5, help='Distance threshold for points added to cloud')
+parser.add_argument('--distance_thresh', type=float, default=0.2, help='Distance threshold for points added to cloud')
 parser.add_argument('--ignore_classes_in_point_cloud', type=str, default="background,fish,human", help='Classes to ignore when adding points to cloud')
 parser.add_argument('--ignore_classes_in_benthic_cover', type=str, default="background,fish,human,transect tools,transect line,dark", help='Classes to ignore when calculating benthic cover percentages')
 parser.add_argument('--intrinsics_file', type=str, default="./seg_data/intrinsics_eucm.json", help='Path to intrinsics file')
