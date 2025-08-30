@@ -34,6 +34,12 @@ class SfMModel(nn.Module):
             B = images[0].shape[0]
             intrinsics = intrinsics.unsqueeze(0).repeat(B, 1, 1)
         depths, poses, _ = self.get_depth_and_poses_from_features(images, features, intrinsics)
+        if not hasattr(self, "_dbg_out_once"):
+            def shp(x): return None if x is None else tuple(x.shape)
+            print(">>> MODEL OUTPUT",
+                   "depths", shp(depths),
+                   "poses", shp(poses))
+            self._dbg_out_once = True
         return depths, poses
 
     def extract_features(self, x):

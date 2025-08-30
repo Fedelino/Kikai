@@ -31,10 +31,10 @@ parser.add_argument('--input_video', type=str, help='Path to video file - can be
 parser.add_argument('--out_dir', type=str, default='out', help='Path to output directory - will be created if does not exist')
 parser.add_argument('--tmp_dir', type=str, default='tmp', help='Path to temporary directory - will be created if does not exist')
 parser.add_argument('--timestamp', type=str, help='Begin and End timestamp of the transect. In case multiple videos are supplied, the format should be comma separated e.g. of the form "0:23-end,begin-1:44"')
-parser.add_argument('--sfm_checkpoint', type=str, default='./kikai_best.pth', help='Path to the sfm_net checkpoint')
+parser.add_argument('--sfm_checkpoint', type=str, default='./kikai_sfm_best.pth', help='Path to the sfm_net checkpoint')
 parser.add_argument('--segmentation_checkpoint', type=str, default='./segmentation_net.pth', help='Path to the segmentation_net checkpoint')
-parser.add_argument('--height', type=int, default=384, help='Height in pixels to which input video is scaled')
-parser.add_argument('--width', type=int, default=640, help='Width in pixels to which input video is scaled')
+parser.add_argument('--height', type=int, default=192, help='Height in pixels to which input video is scaled')
+parser.add_argument('--width', type=int, default=320, help='Width in pixels to which input video is scaled')
 parser.add_argument('--seg_height', type=int, default=384*2, help='Height in pixels to which input video is scaled')
 parser.add_argument('--seg_width', type=int, default=640*2, help='Width in pixels to which input video is scaled')
 parser.add_argument('--fps', type=int, default=8, help='FPS of the input video')
@@ -42,7 +42,7 @@ parser.add_argument('--reverse', action='store_true', help='Whether the transect
 parser.add_argument('--number_of_points_per_image', type=int, default=2000, help='Number of points to sample from each image')
 parser.add_argument('--frames_per_volume', type=int, default=500, help='Number of frames per TSDF Volume')
 parser.add_argument('--tsdf_overlap', type=int, default=100, help='Overlap in frames over TSDF Volumes')
-parser.add_argument('--distance_thresh', type=float, default=0.2, help='Distance threshold for points added to cloud')
+parser.add_argument('--distance_thresh', type=float, default=5, help='Distance threshold for points added to cloud')
 parser.add_argument('--ignore_classes_in_point_cloud', type=str, default="background,fish,human", help='Classes to ignore when adding points to cloud')
 parser.add_argument('--ignore_classes_in_benthic_cover', type=str, default="background,fish,human,transect tools,transect line,dark", help='Classes to ignore when calculating benthic cover percentages')
 parser.add_argument('--intrinsics_file', type=str, default="./seg_data/intrinsics_eucm.json", help='Path to intrinsics file')
@@ -52,6 +52,17 @@ parser.add_argument('--output_2d_grid_size', type=int, default=2000, help='Size 
 parser.add_argument('--buffer_size', type=int, default=2, help='Number of frames to use for temporal smoothing')
 parser.add_argument('--render_video', action='store_true', help='Whether to render output 4-panel video')
 args = parser.parse_args()
+
+import json
+
+print(">>> RECON SIZE:", args.width, "x", args.height)
+with open(args.intrinsics_file, "r") as f:
+    intr = json.load(f)
+print(">>> INTRINSICS:", intr)
+
+# EUCM sanity (linear/pinhole)
+assert float(intr.get("beta", 1.0)) == 1.0, "beta must be 1.0 for linear EUCM"
+assert float(intr.get("alpha", 0.0)) == 0.0, "alpha must be 0.0 for linear EUCM"
 
 def main(args):
     t = time()
@@ -70,6 +81,8 @@ def main(args):
         args.tmp_dir,
         args.reverse,
     )
+    print(">>> #frames:", len(img_list := [args.tmp_dir + "/rgb/" + f for f in sorted(os.listdir(args.tmp_dir + "/rgb")) if "jpg" in f]))
+    print(">>> GRAV vectors:", None if grav is None else float(np.nanmean(np.linalg.norm(grav, axis=1))))
     print("Extracted Frames And Gravity Vector in", time() - t, "seconds")
     h5f = h5py.File(args.tmp_dir + '/tmp.hdf5', 'w')
     img_list = [args.tmp_dir + "/rgb/" +file for file in sorted(os.listdir(args.tmp_dir + "/rgb")) if "jpg" in file]
@@ -268,7 +281,13 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
             depth_uncertainties[i] = 0
             intrinsics_predicted[i] = intrinsics[0].cpu().numpy()
 
-    semantic_segmentation[-1] = (semseg_buffer * wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
+    print(">>> depth shape:", np.asarray(depths).shape)  # expect (N, H, W)
+    if len(depths) > 0:
+        d0 = np.asarray(depths)[0]
+        print(">>> depth stats f0: min/max/mean/std =",
+              float(np.nanmin(d0)), float(np.nanmax(d0)),
+              float(np.nanmean(d0)), float(np.nanstd(d0)))
+        semantic_segmentation[-1] = (semseg_buffer * wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
 
     pose_list = []
     for k in range(len(poses) - 1):
